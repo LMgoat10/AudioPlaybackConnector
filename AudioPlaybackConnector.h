@@ -40,5 +40,8 @@ std::vector<std::wstring> g_lastDevices;
 
 #include "Util.hpp"
 #include "I18n.hpp"
-#include "SettingsUtil.hpp"
+
+void LoadSettings();
+void SaveSettings();
+
 #include "Direct2DSvg.hpp"

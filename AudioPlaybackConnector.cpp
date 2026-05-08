@@ -4,10 +4,10 @@
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupFlyout();
 void SetupMenu();
-winrt::fire_and_forget ConnectDevice(DevicePicker, std::wstring_view);
-void SetupDevicePicker();
+winrt::fire_and_forget ConnectDevice(DevicePicker, std::wstring); void SetupDevicePicker();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
+
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
@@ -180,6 +180,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_CONNECTDEVICE:
 		if (g_reconnect)
 		{
+			auto devices = g_lastDevices;   // 拷贝一份，避免协程期间引用失效
+
 			for (const auto& i : g_lastDevices)
 			{
 				ConnectDevice(g_devicePicker, i);
@@ -309,8 +311,13 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 					auto it = g_audioPlaybackConnections.find(std::wstring(sender.DeviceId()));
 					if (it != g_audioPlaybackConnections.end())
 					{
-						g_devicePicker.SetDisplayStatus(it->second.first, {}, DevicePickerDisplayStatusOptions::None);
+						auto device = it->second.first;
+						g_devicePicker.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
 						g_audioPlaybackConnections.erase(it);
+						if (g_reconnect)
+						{
+							ConnectDevice(g_devicePicker, device);
+						}
 					}
 					sender.Close();
 				}
@@ -367,6 +374,26 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 	if (success)
 	{
 		picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+
+		std::wstring deviceId = std::wstring(device.Id());
+
+		auto it = std::find(g_lastDevices.begin(), g_lastDevices.end(), deviceId);
+		if (it != g_lastDevices.end())
+		{
+			g_lastDevices.erase(it);
+		}
+
+		// 放到最前面，表示这是最近一次成功连接的设备
+		g_lastDevices.insert(g_lastDevices.begin(), deviceId);
+
+		// 如果只想记住“最后一个设备”，保留这一行
+		if (g_lastDevices.size() > 1)
+		{
+			g_lastDevices.resize(1);
+		}
+
+		g_reconnect = true;
+		SaveSettings();
 	}
 	else
 	{
@@ -380,10 +407,21 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 	}
 }
 
-winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view deviceId)
+winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring deviceId)
 {
-	auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
-	ConnectDevice(picker, device);
+	try
+	{
+		auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
+
+		if (device)
+		{
+			ConnectDevice(picker, device);
+		}
+	}
+	catch (winrt::hresult_error const&)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
 }
 
 void SetupDevicePicker()
@@ -448,4 +486,123 @@ void UpdateNotifyIcon()
 			LOG_LAST_ERROR();
 		}
 	}
+}
+
+void SaveSettings()
+{
+	HKEY hKey = nullptr;
+
+	if (RegCreateKeyExW(
+		HKEY_CURRENT_USER,
+		LR"(Software\AudioPlaybackConnector)",
+		0,
+		nullptr,
+		0,
+		KEY_WRITE,
+		nullptr,
+		&hKey,
+		nullptr) != ERROR_SUCCESS)
+	{
+		return;
+	}
+
+	DWORD reconnect = g_reconnect ? 1 : 0;
+	RegSetValueExW(
+		hKey,
+		L"Reconnect",
+		0,
+		REG_DWORD,
+		reinterpret_cast<const BYTE*>(&reconnect),
+		sizeof(reconnect));
+
+	std::wstring devices;
+
+	for (const auto& id : g_lastDevices)
+	{
+		devices += id;
+		devices += L"\n";
+	}
+
+	RegSetValueExW(
+		hKey,
+		L"LastDevices",
+		0,
+		REG_SZ,
+		reinterpret_cast<const BYTE*>(devices.c_str()),
+		static_cast<DWORD>((devices.size() + 1) * sizeof(wchar_t)));
+
+	RegCloseKey(hKey);
+}
+
+void LoadSettings()
+{
+	HKEY hKey = nullptr;
+
+	if (RegOpenKeyExW(
+		HKEY_CURRENT_USER,
+		LR"(Software\AudioPlaybackConnector)",
+		0,
+		KEY_READ,
+		&hKey) != ERROR_SUCCESS)
+	{
+		g_reconnect = true;
+		return;
+	}
+
+	DWORD reconnect = 1;
+	DWORD cbReconnect = sizeof(reconnect);
+
+	if (RegGetValueW(
+		hKey,
+		nullptr,
+		L"Reconnect",
+		RRF_RT_REG_DWORD,
+		nullptr,
+		&reconnect,
+		&cbReconnect) == ERROR_SUCCESS)
+	{
+		g_reconnect = reconnect != 0;
+	}
+	else
+	{
+		g_reconnect = true;
+	}
+
+	wchar_t buffer[8192]{};
+	DWORD cbBuffer = sizeof(buffer);
+
+	if (RegGetValueW(
+		hKey,
+		nullptr,
+		L"LastDevices",
+		RRF_RT_REG_SZ,
+		nullptr,
+		buffer,
+		&cbBuffer) == ERROR_SUCCESS)
+	{
+		g_lastDevices.clear();
+
+		std::wstring data = buffer;
+		size_t start = 0;
+
+		while (start < data.size())
+		{
+			size_t pos = data.find(L'\n', start);
+			std::wstring id = data.substr(start, pos - start);
+
+			if (!id.empty())
+			{
+				g_lastDevices.push_back(id);
+			}
+
+			if (pos == std::wstring::npos)
+			{
+				break;
+			}
+
+			start = pos + 1;
+		}
+	}
+
+	RegCloseKey(hKey);
 }
